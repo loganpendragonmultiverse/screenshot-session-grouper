@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "screenshot-session-grouper"
-version = "1.0.0"
+version = "1.1.0"
 description = "Group game screenshots into likely sessions using timestamps and export reviewable sets."
 readme = "README.md"
 requires-python = ">=3.10"
