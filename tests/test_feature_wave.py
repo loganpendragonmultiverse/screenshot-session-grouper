@@ -134,3 +134,59 @@ def test_legacy_scan_report_still_exports(tmp_path):
     destination = tmp_path / "copies"
     export_copies(report, destination)
     assert len(json.loads((destination / "manifest.json").read_text())["copies"]) == 3
+
+
+def test_source_changed_after_preflight_is_not_published(tmp_path, monkeypatch):
+    from screenshot_session_grouper import core
+
+    source, paths = fixture(tmp_path)
+    original = {path: path.read_bytes() for path in paths}
+    report = scan(source, boundary_overrides=overrides(paths, "join", 1))
+    real_copy = core.shutil.copy2
+    changed = False
+
+    def concurrent_copy(src, dst):
+        nonlocal changed
+        result = real_copy(src, dst)
+        if src == paths[0]:
+            paths[2].write_bytes(b"synthetic concurrent edit before later copy")
+            changed = True
+        return result
+
+    monkeypatch.setattr(core.shutil, "copy2", concurrent_copy)
+    destination = tmp_path / "copies"
+    with pytest.raises(ValueError, match="stale"):
+        export_copies(report, destination)
+    assert changed
+    assert not destination.exists()
+    assert not (tmp_path / ".copies.tmp").exists()
+    assert paths[0].read_bytes() == original[paths[0]]
+    assert paths[1].read_bytes() == original[paths[1]]
+    assert paths[2].read_bytes() == b"synthetic concurrent edit before later copy"
+
+
+def test_manifest_hashes_staged_bytes_when_source_changes_after_copy(tmp_path, monkeypatch):
+    from screenshot_session_grouper import core
+
+    source, paths = fixture(tmp_path)
+    original = {path: path.read_bytes() for path in paths}
+    report = scan(source, boundary_overrides=overrides(paths, "split"))
+    real_copy = core.shutil.copy2
+
+    def concurrent_copy(src, dst):
+        result = real_copy(src, dst)
+        if src == paths[0]:
+            paths[0].write_bytes(b"synthetic concurrent edit after copy")
+        return result
+
+    monkeypatch.setattr(core.shutil, "copy2", concurrent_copy)
+    destination = tmp_path / "copies"
+    export_copies(report, destination)
+    manifest = json.loads((destination / "manifest.json").read_text())
+    for item in manifest["copies"]:
+        copied = destination / item["destination"]
+        expected = hashlib.sha256(original[source / item["source"]]).hexdigest()
+        assert item["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest() == expected
+    assert paths[0].read_bytes() == b"synthetic concurrent edit after copy"
+    assert paths[1].read_bytes() == original[paths[1]]
+    assert paths[2].read_bytes() == original[paths[2]]

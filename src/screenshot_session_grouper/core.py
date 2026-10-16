@@ -211,11 +211,14 @@ def export_copies(report: dict[str, Any], destination: Path, collision_mode: str
                         sequence += 1
                         target = folder / f"{sequence:04d}-{source_file.name}"
                 shutil.copy2(source_file, target)
+                copied_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                if "sha256" in item and copied_sha256 != item["sha256"]:
+                    raise ValueError("stale screenshot: copied bytes differ from reviewed scan")
                 manifest.append(
                     {
                         "source": item["path"],
                         "destination": target.relative_to(temporary).as_posix(),
-                        "sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+                        "sha256": copied_sha256,
                     }
                 )
         (temporary / "manifest.json").write_text(

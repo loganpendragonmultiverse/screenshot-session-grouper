@@ -2,6 +2,8 @@
 
 ## 1.2.0 - 2026-10-16
 
+- Verify staged copied bytes against reviewed hashes before publishing; derive manifest hashes from staged bytes.
+
 - Allow reviewed split/join decisions at named adjacent screenshot boundaries, with automatic and manual provenance.
 - Add synthetic regression coverage and packaged development/testing documentation.
 
