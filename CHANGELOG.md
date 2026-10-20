@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 - 2026-10-20
+
+- Fail unreadable screenshot discovery and hash in bounded chunks with stable metadata checks.
+- Validate scan/export controls and manifests; support empty export and portable case/Unicode collisions.
+- Protect report/destination paths and exclusively own staging before cleanup.
+- Render literal Markdown filenames and document sequential output boundaries.
+
 ## 1.2.0 - 2026-10-16
 
 - Verify staged copied bytes against reviewed hashes before publishing; derive manifest hashes from staged bytes.

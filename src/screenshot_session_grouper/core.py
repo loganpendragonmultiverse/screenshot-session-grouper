@@ -5,6 +5,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from itertools import pairwise
 from pathlib import Path
@@ -17,6 +19,8 @@ FILENAME_TIME = re.compile(
 
 
 def _parse_timezone(value: str) -> timezone:
+    if not isinstance(value, str):
+        raise TypeError("timezone-offset must be text")
     if value in {"Z", "+00:00", "-00:00"}:
         return timezone.utc
     match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", value)
@@ -76,6 +80,7 @@ def _boundaries(
     if (
         not isinstance(overrides, dict)
         or set(overrides) != {"version", "boundaries"}
+        or type(overrides["version"]) is not int
         or overrides["version"] != 1
         or not isinstance(overrides["boundaries"], list)
     ):
@@ -109,6 +114,40 @@ def _boundaries(
     return boundaries
 
 
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    count = 0
+    with path.open("rb") as stream:
+        initial = os.fstat(stream.fileno())
+        if not stat.S_ISREG(initial.st_mode):
+            raise ValueError("screenshot must be a regular file")
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+            count += len(chunk)
+        final = os.fstat(stream.fileno())
+    if count != initial.st_size or (initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns) != (
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    ):
+        raise ValueError("screenshot changed during hashing")
+    return digest.hexdigest()
+
+
+def _screenshots(directory: Path):
+    with os.scandir(directory) as iterator:
+        entries = sorted(iterator, key=lambda entry: entry.name)
+    for entry in entries:
+        metadata = entry.stat(follow_symlinks=False)
+        if getattr(metadata, "st_file_attributes", 0) & 0x400:
+            continue
+        mode = metadata.st_mode
+        if stat.S_ISDIR(mode):
+            yield from _screenshots(Path(entry.path))
+        elif stat.S_ISREG(mode) and Path(entry.name).suffix.casefold() in EXTENSIONS:
+            yield Path(entry.path)
+
+
 def scan(
     source: Path,
     gap_minutes: int = 90,
@@ -116,21 +155,26 @@ def scan(
     *,
     boundary_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not source.is_dir():
-        raise ValueError("source must be a directory")
-    if gap_minutes <= 0:
-        raise ValueError("gap-minutes must be positive")
+    if source.is_symlink():
+        raise ValueError("source must be a directory, not a symlink")
+    try:
+        metadata = source.lstat()
+        mode = metadata.st_mode
+    except FileNotFoundError as exc:
+        raise ValueError("source must be a directory") from exc
+    if not stat.S_ISDIR(mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        raise ValueError("source must be a directory without reparse links")
+    if type(gap_minutes) is not int or gap_minutes <= 0:
+        raise ValueError("gap-minutes must be a positive integer")
     source_timezone = _parse_timezone(timezone_offset)
     screenshots = []
-    for path in source.rglob("*"):
-        if not path.is_file() or path.is_symlink() or path.suffix.casefold() not in EXTENSIONS:
-            continue
+    for path in _screenshots(source):
         parsed = _filename_timestamp(path, source_timezone)
         timestamp = parsed or datetime.fromtimestamp(path.stat().st_mtime, source_timezone)
         screenshots.append(
             {
                 "path": path.relative_to(source).as_posix(),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sha256": _hash_file(path),
                 "timestamp": timestamp.isoformat(timespec="seconds"),
                 "source": "filename" if parsed else "modified-time",
             }
@@ -171,47 +215,96 @@ def timestamp_offset(value: timezone) -> str:
 
 
 def export_copies(report: dict[str, Any], destination: Path, collision_mode: str = "error") -> None:
+    if (
+        not isinstance(report, dict)
+        or type(report.get("version")) is not int
+        or report["version"] != 1
+        or not isinstance(report.get("source"), str)
+        or not report["source"]
+        or not isinstance(report.get("sessions"), list)
+    ):
+        raise ValueError("export requires a version 1 scan report")
     source = Path(report["source"])
+    metadata = source.lstat()
+    if (
+        source.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("report source must be a regular directory without links")
+    source = source.resolve()
+    if destination.is_symlink():
+        raise ValueError("copy destination already exists")
     destination = destination.resolve()
     if destination.exists():
         raise ValueError("copy destination already exists")
     if source == destination or source in destination.parents:
         raise ValueError("copy destination cannot be inside the screenshot source")
     temporary = destination.with_name(f".{destination.name}.tmp")
-    if temporary.exists():
+    if temporary.exists() or temporary.is_symlink():
         raise ValueError("temporary export path already exists")
-    if collision_mode not in {"error", "sequence"}:
+    if not isinstance(collision_mode, str) or collision_mode not in {"error", "sequence"}:
         raise ValueError("collision-mode must be error or sequence")
     # Validate every source reference and reviewed hash before creating the staging directory.
+    seen_sessions, seen_paths = set(), set()
     for session in report["sessions"]:
+        if (
+            not isinstance(session, dict)
+            or not isinstance(session.get("id"), str)
+            or not isinstance(session.get("screenshots"), list)
+        ):
+            raise TypeError("invalid export session")
+        if session["id"] in seen_sessions:
+            raise ValueError("duplicate session identifier")
+        seen_sessions.add(session["id"])
         if not re.fullmatch(r"session-[0-9]+", session["id"]):
             raise ValueError("invalid session identifier")
         for item in session["screenshots"]:
+            if not isinstance(item, dict) or "path" not in item:
+                raise ValueError("invalid screenshot item")
             relative = _relative_reference(item["path"])
+            if relative in seen_paths:
+                raise ValueError("duplicate screenshot reference")
+            seen_paths.add(relative)
+            if "sha256" in item and (
+                not isinstance(item["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+            ):
+                raise ValueError("invalid screenshot SHA-256")
             path = source / relative
             if path.is_symlink() or not path.resolve().is_relative_to(source.resolve()):
                 raise ValueError("screenshot reference escapes source")
-            if "sha256" in item and hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+            if "sha256" in item and _hash_file(path) != item["sha256"]:
                 raise ValueError("stale screenshot: source changed since review")
+    for field, count in (
+        ("session_count", len(seen_sessions)),
+        ("screenshot_count", len(seen_paths)),
+    ):
+        if field in report and (type(report[field]) is not int or report[field] != count):
+            raise ValueError("export report count mismatch")
     manifest: list[dict[str, str]] = []
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary.mkdir()
     try:
         for session in report["sessions"]:
             folder = temporary / session["id"]
-            folder.mkdir(parents=True, exist_ok=True)
+            folder.mkdir()
+            used_names: set[str] = set()
             for sequence, item in enumerate(session["screenshots"], start=1):
                 source_file = source / item["path"]
                 target = folder / source_file.name
-                if target.exists():
+                if unicodedata.normalize("NFC", target.name).casefold() in used_names:
                     if collision_mode == "error":
                         raise ValueError(
                             f"duplicate screenshot filename in {session['id']}: {target.name}"
                         )
                     target = folder / f"{sequence:04d}-{source_file.name}"
-                    while target.exists():
+                    while unicodedata.normalize("NFC", target.name).casefold() in used_names:
                         sequence += 1
                         target = folder / f"{sequence:04d}-{source_file.name}"
+                used_names.add(unicodedata.normalize("NFC", target.name).casefold())
                 shutil.copy2(source_file, target)
-                copied_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                copied_sha256 = _hash_file(target)
                 if "sha256" in item and copied_sha256 != item["sha256"]:
                     raise ValueError("stale screenshot: copied bytes differ from reviewed scan")
                 manifest.append(
@@ -229,11 +322,21 @@ def export_copies(report: dict[str, Any], destination: Path, collision_mode: str
             + "\n",
             encoding="utf-8",
         )
+        if destination.exists() or destination.is_symlink():
+            raise ValueError("copy destination appeared during export")
         os.replace(temporary, destination)
     except Exception:
-        if temporary.exists():
+        if temporary.exists() or temporary.is_symlink():
             shutil.rmtree(temporary)
         raise
+
+
+def _filename(value: str) -> str:
+    literal = "".join(
+        f"\\u{ord(char):04x}" if ord(char) < 32 or ord(char) == 127 else char for char in value
+    )
+    fence = "`" * (max((len(x) for x in re.findall(r"`+", literal)), default=0) + 1)
+    return fence + " " + literal + " " + fence
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -245,12 +348,14 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     for session in report["sessions"]:
         lines.extend([f"## {session['id']} — {session['start']} to {session['end']}", ""])
-        lines.extend(f"- `{item['path']}` ({item['source']})" for item in session["screenshots"])
+        lines.extend(
+            f"- {_filename(item['path'])} ({item['source']})" for item in session["screenshots"]
+        )
         lines.append("")
     if report.get("boundaries"):
         lines.extend(["## Boundary decisions", ""])
         lines.extend(
-            f"- `{item['before']}` → `{item['after']}`: {item['action']} ({item['provenance']}; automatic: {item['automatic_action']})"
+            f"- {_filename(item['before'])} → {_filename(item['after'])}: {item['action']} ({item['provenance']}; automatic: {item['automatic_action']})"
             for item in report["boundaries"]
         )
     return "\n".join(lines).rstrip() + "\n"
