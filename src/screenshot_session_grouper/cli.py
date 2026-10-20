@@ -24,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.output and (args.output.exists() or args.output.is_symlink()):
+            raise ValueError(f"output already exists: {args.output}")
         overrides = (
             json.loads(args.boundary_overrides.read_text(encoding="utf-8"))
             if args.boundary_overrides
@@ -38,12 +40,13 @@ def main(argv: list[str] | None = None) -> int:
             export_copies(report, args.copy_to, args.collision_mode)
         rendered = render_json(report) if args.format == "json" else render_markdown(report)
         if args.output:
-            if args.output.exists():
+            if args.output.exists() or args.output.is_symlink():
                 raise ValueError(f"output already exists: {args.output}")
-            args.output.write_text(rendered, encoding="utf-8")
+            with args.output.open("x", encoding="utf-8") as output:
+                output.write(rendered)
         else:
             sys.stdout.write(rendered)
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

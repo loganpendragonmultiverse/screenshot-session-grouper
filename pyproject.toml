@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "screenshot-session-grouper"
-version = "1.2.0"
+version = "1.2.1"
 description = "Group game screenshots into likely sessions using timestamps and export reviewable sets."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,3 +34,5 @@ addopts = "--cov=screenshot_session_grouper --cov-branch --cov-report=term-missi
 
 [tool.setuptools.data-files]
 "share/doc/screenshot-session-grouper" = ["README.md", "CHANGELOG.md", "DEVELOPMENT.md", "TESTING.md", "LICENSE"]
+
+"share/doc/screenshot-session-grouper/examples" = ["examples/README.md"]
